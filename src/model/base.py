@@ -59,18 +59,15 @@ class BaseAttentionPlugin(nn.Module, ABC):
         else:
             self.layer_range = layer_range
 
-        # Learnable: per-layer vector OR unified scalar
+        # Learnable:
+        #   free_train=True  → shape [N], independent scalar per layer
+        #   free_train=False → shape [1], one shared scalar for all layers
+        # Hook always indexes [layer_idx] or [0] accordingly.
         if learnable:
-            if free_train:
-                # Independent scalar for every targeted layer
-                self.boost_strength = nn.Parameter(
-                    torch.ones(len(self.layer_range)) * boost_strength
-                )
-            else:
-                # Single scalar shared by all targeted layers
-                self.boost_strength = nn.Parameter(
-                    torch.tensor(float(boost_strength))
-                )
+            n = len(self.layer_range) if free_train else 1
+            self.boost_strength = nn.Parameter(
+                torch.ones(n) * boost_strength
+            )
         else:
             self.boost_strength = boost_strength
 
@@ -250,10 +247,11 @@ class BaseAttentionPlugin(nn.Module, ABC):
                             bp = torch.cat([bp, pad], dim=1)
 
                         strength = plugin.boost_strength
-                        if plugin.learnable and plugin.boost_strength.ndim > 0:
-                            # per-layer mode: index into vector
-                            strength = plugin.boost_strength[layer_idx]
-                        # unified mode: boost_strength is already a 0-d scalar tensor
+                        if plugin.learnable:
+                            # free_train: each layer has its own scalar
+                            # unified:    all layers share boost_strength[0]
+                            idx = layer_idx if plugin.free_train else 0
+                            strength = plugin.boost_strength[idx]
                         if isinstance(strength, torch.Tensor):
                             strength = strength.to(device=device, dtype=dtype)
 

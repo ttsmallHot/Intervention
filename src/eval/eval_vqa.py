@@ -230,6 +230,7 @@ def main():
             mode           = ckpt.get("mode", cfg.get("mode", "image")),
             layer_range    = ckpt.get("layer_range", None),
             learnable      = True,
+            free_train     = ckpt.get("free_train", cfg.get("free_train", True)),
         )
         load_checkpoint(plugin, checkpoint_path)
         plugin.apply()

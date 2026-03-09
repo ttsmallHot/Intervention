@@ -280,6 +280,7 @@ def save_checkpoint(plugin, epoch: int, val_acc: float, output_dir: str, tag: st
         "boost_strength": plugin.boost_strength.data.cpu(),
         "layer_range":    plugin.layer_range,
         "mode":           plugin.mode,
+        "free_train":     plugin.free_train,
         "val_acc":        val_acc,
     }, path)
     return path
@@ -287,8 +288,14 @@ def save_checkpoint(plugin, epoch: int, val_acc: float, output_dir: str, tag: st
 
 def load_checkpoint(plugin, checkpoint_path: str, device="cpu"):
     ckpt = torch.load(checkpoint_path, map_location=device)
-    with torch.no_grad():
-        plugin.boost_strength.data.copy_(
-            ckpt["boost_strength"].to(plugin.boost_strength.device)
+    saved = ckpt["boost_strength"].to(plugin.boost_strength.device)
+    if saved.shape != plugin.boost_strength.shape:
+        raise RuntimeError(
+            f"Checkpoint boost_strength shape {tuple(saved.shape)} "
+            f"!= plugin shape {tuple(plugin.boost_strength.shape)}. "
+            f"Checkpoint was trained with free_train="
+            f"{ckpt.get('free_train', 'unknown')}."
         )
+    with torch.no_grad():
+        plugin.boost_strength.data.copy_(saved)
     return ckpt
