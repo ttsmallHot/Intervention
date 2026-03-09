@@ -1,0 +1,14 @@
+# Eval config — InternVL3.5-4B + FrozenLake probe (VQA accuracy)
+model_type : internvl
+model_path : /code/InternVL3_5-4B
+data_path  : /code/data/frozenlake_probe_train/train.parquet
+
+# Checkpoint to evaluate (trained plugin)
+checkpoint : /code/Intervention/checkpoints/internvl_frozenlake/best_plugin.pt
+
+# Results output
+output_dir : /code/Intervention/results/internvl_frozenlake
+
+# Eval options
+max_samples   : null
+fixed_strength: 1.0     # fallback strength if checkpoint is not found

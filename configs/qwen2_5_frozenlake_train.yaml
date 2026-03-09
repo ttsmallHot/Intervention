@@ -1,0 +1,17 @@
+# Intervention config — Qwen2.5-VL-3B + FrozenLake probe
+model_type : qwen2_5vl
+model_path : /code/Qwen2.5-VL-3B-Instruct
+data_path  : /code/data/frozenlake_probe_train/train.parquet
+output_dir : /code/Intervention/checkpoints/qwen2_5_frozenlake
+
+# Plugin
+mode          : image        # image | text | both | oppose
+boost_strength_init : 0.0    # initial value for learnable strength
+# layer_range : null         # null = auto (deeper half of network)
+
+# Training
+num_epochs   : 50
+batch_size   : 32
+learning_rate: 1.0e-2
+eval_every   : 5
+max_samples  : null           # null = use all data

@@ -1,0 +1,14 @@
+# Eval config — Qwen3-VL-4B + FrozenLake probe (VQA accuracy)
+model_type : qwen3vl
+model_path : /code/Qwen3-VL-4B-Instruct
+data_path  : /code/data/frozenlake_probe_train/train.parquet
+
+# Checkpoint to evaluate (trained plugin)
+checkpoint : /code/Intervention/checkpoints/qwen3_frozenlake/best_plugin.pt
+
+# Results output
+output_dir : /code/Intervention/results/qwen3_frozenlake
+
+# Eval options
+max_samples   : null
+fixed_strength: 1.0     # fallback strength if checkpoint is not found

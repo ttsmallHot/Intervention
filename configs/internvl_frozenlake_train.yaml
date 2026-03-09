@@ -1,0 +1,17 @@
+# Intervention config — InternVL3.5-4B + FrozenLake probe
+model_type : internvl
+model_path : /code/InternVL3_5-4B
+data_path  : /code/data/frozenlake_probe_train/train.parquet
+output_dir : /code/Intervention/checkpoints/internvl_frozenlake
+
+# Plugin
+mode          : image
+boost_strength_init : 0.0
+# layer_range : null         # null = auto (deeper half of Qwen3-36L LLM)
+
+# Training
+num_epochs   : 50
+batch_size   : 16
+learning_rate: 1.0e-2
+eval_every   : 5
+max_samples  : null

@@ -1,0 +1,17 @@
+# Intervention config — LLaVA-Next (llava-v1.6-mistral-7b-hf) + FrozenLake probe
+model_type : llava
+model_path : /code/llava-v1.6-mistral-7b-hf
+data_path  : /code/data/frozenlake_probe_train/train.parquet
+output_dir : /code/Intervention/checkpoints/llava_frozenlake
+
+# Plugin
+mode          : image
+boost_strength_init : 0.0
+# layer_range : null         # null = auto (deeper half)
+
+# Training
+num_epochs   : 50
+batch_size   : 8            # Mistral-7B requires smaller batch
+learning_rate: 1.0e-2
+eval_every   : 5
+max_samples  : null

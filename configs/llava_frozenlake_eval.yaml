@@ -1,0 +1,14 @@
+# Eval config — LLaVA-Next (llava-v1.6-mistral-7b-hf) + FrozenLake probe (VQA accuracy)
+model_type : llava
+model_path : /code/llava-v1.6-mistral-7b-hf
+data_path  : /code/data/frozenlake_probe_train/train.parquet
+
+# Checkpoint to evaluate (trained plugin)
+checkpoint : /code/Intervention/checkpoints/llava_frozenlake/best_plugin.pt
+
+# Results output
+output_dir : /code/Intervention/results/llava_frozenlake
+
+# Eval options
+max_samples   : null
+fixed_strength: 1.0     # fallback strength if checkpoint is not found
