@@ -1,4 +1,4 @@
-# Intervention — Attention Steering for Multimodal LLMs
+# Intervention — The code for paper "RL Teaches VLMs to Look: From Mechanistic Insights on Attention Shift to Efficient Adaptation"
 
 Steers a frozen multimodal LLM's attention toward image tokens by injecting learned per-layer scalar biases into the attention mask.
 
