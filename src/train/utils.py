@@ -50,8 +50,13 @@ class VQADataset(Dataset):
 # Collate functions (one per model family)
 # ---------------------------------------------------------------------------
 
-def collate_qwen(batch: list, processor, pad_token_id: int = 151643) -> tuple:
-    """Collate for Qwen2.5-VL and Qwen3-VL (share the same processor API)."""
+def collate_qwen(batch: list, processor) -> tuple:
+    """Collate for Qwen2.5-VL and Qwen3-VL (share the same processor API).
+
+    Uses the full_real_len - prompt_real_len diff method (same as collate_llava)
+    so that label token count is always accurate regardless of pad_token_id or
+    padding side.
+    """
     images      = [item["image"]  for item in batch]
     prompts     = [item["prompt"] for item in batch]
     labels_text = [item["label"]  for item in batch]
@@ -76,27 +81,97 @@ def collate_qwen(batch: list, processor, pad_token_id: int = 151643) -> tuple:
     if mode == "train":
         texts_full = [tp + lb for tp, lb in zip(texts_prompt, labels_text)]
 
-        # Compute prompt lengths to mask out loss on prompt tokens
+        # Tokenize prompt-only and full sequence.
+        # label_token_count = full_real_len - prompt_real_len is accurate in any
+        # tokenizer context (no standalone-tokenization space-prefix issue,
+        # no hardcoded pad_token_id dependency).
         inp_prompt = processor(
             text=texts_prompt, images=images, padding=True, return_tensors="pt"
         )
-        prompt_lens = [
-            (inp_prompt["input_ids"][i] != pad_token_id).sum().item()
-            for i in range(len(batch))
-        ]
-
         inputs = processor(
             text=texts_full, images=images, padding=True, return_tensors="pt"
         )
-        labels = inputs["input_ids"].clone()
-        for i, pl in enumerate(prompt_lens):
-            labels[i, :pl] = -100
+
+        labels = torch.full_like(inputs["input_ids"], -100)
+        for i in range(len(batch)):
+            prompt_real_len   = inp_prompt["attention_mask"][i].sum().item()
+            full_real_len     = inputs["attention_mask"][i].sum().item()
+            label_token_count = full_real_len - prompt_real_len
+            if label_token_count <= 0:
+                continue
+            real_pos = inputs["attention_mask"][i].nonzero(as_tuple=True)[0]
+            label_positions = real_pos[-label_token_count:]
+            labels[i][label_positions] = inputs["input_ids"][i][label_positions]
+
         inputs["labels"] = labels
         return inputs, labels_text
 
     else:  # inference
         inputs = processor(
             text=texts_prompt, images=images, padding=True, return_tensors="pt"
+        )
+        return inputs, labels_text
+
+
+def collate_gemma3(batch: list, processor) -> tuple:
+    """Collate for Gemma-3 multimodal processor.
+
+    Gemma3Processor requires images as a nested list [[img1], [img2], ...]
+    where each inner list corresponds to images for one text sample.
+    Passing a flat list causes "inconsistently sized batches of images/text".
+
+    Otherwise identical logic to collate_qwen (diff method for label masking).
+    """
+    images      = [item["image"]  for item in batch]
+    prompts     = [item["prompt"] for item in batch]
+    labels_text = [item["label"]  for item in batch]
+    mode        = batch[0]["mode"]
+
+    # Gemma3 processor needs nested image list
+    images_nested = [[img] for img in images]
+
+    all_messages = []
+    for img, prompt in zip(images, prompts):
+        all_messages.append([{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": img},
+                {"type": "text",  "text": prompt},
+            ],
+        }])
+
+    texts_prompt = [
+        processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
+        for m in all_messages
+    ]
+
+    if mode == "train":
+        texts_full = [tp + lb for tp, lb in zip(texts_prompt, labels_text)]
+
+        inp_prompt = processor(
+            text=texts_prompt, images=images_nested, padding=True, return_tensors="pt"
+        )
+        inputs = processor(
+            text=texts_full, images=images_nested, padding=True, return_tensors="pt"
+        )
+
+        labels = torch.full_like(inputs["input_ids"], -100)
+        for i in range(len(batch)):
+            prompt_real_len   = inp_prompt["attention_mask"][i].sum().item()
+            full_real_len     = inputs["attention_mask"][i].sum().item()
+            label_token_count = full_real_len - prompt_real_len
+            if label_token_count <= 0:
+                continue
+            real_pos = inputs["attention_mask"][i].nonzero(as_tuple=True)[0]
+            label_positions = real_pos[-label_token_count:]
+            labels[i][label_positions] = inputs["input_ids"][i][label_positions]
+
+        inputs["labels"] = labels
+        return inputs, labels_text
+
+    else:  # inference
+        inputs = processor(
+            text=texts_prompt, images=images_nested, padding=True, return_tensors="pt"
         )
         return inputs, labels_text
 

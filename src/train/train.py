@@ -1,7 +1,7 @@
 """
 Unified training script for Attention Intervention plugins.
 
-Supports: qwen2_5vl | qwen3vl | llava | internvl
+Supports: qwen2_5vl | qwen3vl | llava | internvl | gemma3
 Dataset : VQA-style parquet (image, prompt, label)
 
 Usage
@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.join(_HERE, "..", ".."))
 
 from src.model import build_plugin
 from src.train.utils import (
-    VQADataset, collate_qwen, collate_llava,
+    VQADataset, collate_qwen, collate_gemma3, collate_llava,
     compute_accuracy, save_checkpoint
 )
 
@@ -72,6 +72,12 @@ def load_model_and_processor(cfg: dict):
             model_path, trust_remote_code=True,
             torch_dtype=torch.bfloat16, device_map="auto"
         )
+    elif model_type == "gemma3":
+        from transformers import Gemma3ForConditionalGeneration
+        model = Gemma3ForConditionalGeneration.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, device_map="auto",
+            attn_implementation="eager"
+        )
     else:
         raise ValueError(f"Unsupported model_type: {model_type}")
 
@@ -82,6 +88,8 @@ def load_model_and_processor(cfg: dict):
 def get_collate_fn(model_type: str, processor):
     if model_type in ("qwen2_5vl", "qwen3vl"):
         return lambda batch: collate_qwen(batch, processor)
+    elif model_type == "gemma3":
+        return lambda batch: collate_gemma3(batch, processor)
     elif model_type == "llava":
         return lambda batch: collate_llava(batch, processor)
     elif model_type == "internvl":
@@ -166,6 +174,7 @@ def train(cfg: dict):
         mode           = cfg.get("mode", "image"),
         layer_range    = cfg.get("layer_range", None),
         learnable      = True,
+        free_train     = cfg.get("free_train", True),
     )
     plugin.apply()
 
@@ -228,6 +237,9 @@ def train(cfg: dict):
 
             optimizer.zero_grad()
             loss.backward()
+            grad_clip = cfg.get("grad_clip", None)
+            if grad_clip:
+                torch.nn.utils.clip_grad_norm_(plugin.parameters(), grad_clip)
             optimizer.step()
 
             total_loss += loss.item()

@@ -34,11 +34,21 @@ class BaseAttentionPlugin(nn.Module, ABC):
         mode: str = "image",
         layer_range: Optional[List[int]] = None,
         learnable: bool = False,
+        free_train: bool = True,
     ):
+        """
+        Parameters
+        ----------
+        free_train : bool
+            Only relevant when ``learnable=True``.
+            True  → one independent scalar per layer  (per-layer, shape [N])
+            False → single shared scalar across layers (unified,   shape [])
+        """
         super().__init__()
         self.model = model
         self.mode = mode          # "image" | "text" | "both" | "oppose"
         self.learnable = learnable
+        self.free_train = free_train
 
         # Resolve total number of transformer layers
         self.num_layers = self._count_layers()
@@ -49,11 +59,18 @@ class BaseAttentionPlugin(nn.Module, ABC):
         else:
             self.layer_range = layer_range
 
-        # Learnable per-layer scalar OR fixed scalar
+        # Learnable: per-layer vector OR unified scalar
         if learnable:
-            self.boost_strength = nn.Parameter(
-                torch.ones(len(self.layer_range)) * boost_strength
-            )
+            if free_train:
+                # Independent scalar for every targeted layer
+                self.boost_strength = nn.Parameter(
+                    torch.ones(len(self.layer_range)) * boost_strength
+                )
+            else:
+                # Single scalar shared by all targeted layers
+                self.boost_strength = nn.Parameter(
+                    torch.tensor(float(boost_strength))
+                )
         else:
             self.boost_strength = boost_strength
 
@@ -103,6 +120,81 @@ class BaseAttentionPlugin(nn.Module, ABC):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def build_prompt(self, processor, image, prompt_text: str) -> tuple:
+        """
+        Build processor inputs for a single sample.
+
+        Returns:
+            inputs  : dict of tensors ready for model()
+            messages: the message list (for debugging)
+
+        Default implementation: Qwen-style with embedded PIL in content.
+        Override in subclasses that need different message formats (e.g. LLaVA).
+        """
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text",  "text": prompt_text},
+            ],
+        }]
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=[text], images=[image], padding=True, return_tensors="pt")
+        return inputs, messages
+
+    def compute_rapt(self, outputs, input_ids: torch.Tensor) -> dict:
+        """
+        Compute RAPT (Relative Attention Proportion to Target) for the last token.
+
+        Uses `_build_img_mask` so each subclass automatically gets the correct
+        image-token positions — no hardcoded token ids needed.
+
+        Args:
+            outputs   : model output with output_attentions=True (single sample)
+            input_ids : [L] 1-D token id tensor (single sample)
+        Returns:
+            {"image": float, "text": float}
+        """
+        if outputs.attentions is None:
+            return {"image": 0.0, "text": 0.0}
+
+        num_layers  = len(outputs.attentions)
+        deep_layers = outputs.attentions[num_layers // 2:]
+
+        # Average over deep layers and all heads; last-token row
+        avg_attn = torch.stack(
+            [a[0].mean(dim=0).cpu().float() for a in deep_layers]
+        ).mean(dim=0)                       # [seq, seq]
+
+        seq_len = avg_attn.shape[-1]        # may differ from input_ids len (LLaVA expands)
+        received = avg_attn[-1, :]          # [seq]
+
+        # Build img_mask at the attention sequence length
+        img_mask_2d = self._build_img_mask(input_ids.unsqueeze(0))  # [1, L_orig]
+        img_mask    = img_mask_2d[0].cpu()                          # [L_orig] on CPU
+
+        # If attention is over the expanded sequence (e.g. LLaVA), use bias_pattern
+        if seq_len != img_mask.shape[0] and self.bias_pattern is not None:
+            bp = self.bias_pattern[0]          # [L_expanded]
+            if bp.shape[0] == seq_len:
+                img_mask  = bp.cpu().bool()
+        elif seq_len != img_mask.shape[0]:
+            # Cannot align — return zeros
+            return {"image": 0.0, "text": 0.0}
+
+        pad_id    = getattr(self.model.config, "pad_token_id", 0)
+        text_mask = (~img_mask) & (input_ids.cpu() != pad_id) \
+                    if seq_len == input_ids.shape[0] \
+                    else ~img_mask.cpu()
+
+        global_mean = received.mean().item()
+        if global_mean == 0:
+            return {"image": 0.0, "text": 0.0}
+
+        img_rapt  = (received[img_mask].mean().item()  / global_mean) if img_mask.any()  else 0.0
+        text_rapt = (received[text_mask].mean().item() / global_mean) if text_mask.any() else 0.0
+        return {"image": img_rapt, "text": text_rapt}
 
     def update_masks(self, input_ids: torch.Tensor, **kwargs):
         """Compute and store the bias pattern from the current input_ids."""
@@ -158,8 +250,10 @@ class BaseAttentionPlugin(nn.Module, ABC):
                             bp = torch.cat([bp, pad], dim=1)
 
                         strength = plugin.boost_strength
-                        if plugin.learnable:
+                        if plugin.learnable and plugin.boost_strength.ndim > 0:
+                            # per-layer mode: index into vector
                             strength = plugin.boost_strength[layer_idx]
+                        # unified mode: boost_strength is already a 0-d scalar tensor
                         if isinstance(strength, torch.Tensor):
                             strength = strength.to(device=device, dtype=dtype)
 
@@ -180,7 +274,12 @@ class BaseAttentionPlugin(nn.Module, ABC):
                 )
 
         mode_str = self.mode.capitalize()
-        strength_str = "Learnable" if self.learnable else str(self.boost_strength)
+        if self.learnable:
+            n = self.boost_strength.numel()
+            kind = "per-layer" if self.free_train else "unified"
+            strength_str = f"Learnable ({kind}, {n} param{'s' if n > 1 else ''})"
+        else:
+            strength_str = str(self.boost_strength)
         print(
             f"[Plugin] {mode_str}Boost applied | "
             f"layers {self.layer_range[0]}-{self.layer_range[-1]} | "

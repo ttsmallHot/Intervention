@@ -1,7 +1,7 @@
 """
 VQA accuracy evaluation: Base model vs Base + trained plugin.
 
-Supports: qwen2_5vl | qwen3vl | llava | internvl
+Supports: qwen2_5vl | qwen3vl | llava | internvl | gemma3
 
 Usage
 -----
@@ -34,7 +34,6 @@ sys.path.insert(0, os.path.join(_HERE, "..", ".."))
 
 from src.model import build_plugin
 from src.train.utils import save_checkpoint, load_checkpoint, VQADataset
-from src.eval.utils import compute_rapt
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +68,12 @@ def load_model(cfg: dict):
             model_path, trust_remote_code=True,
             torch_dtype=torch.bfloat16, device_map="auto"
         )
+    elif model_type == "gemma3":
+        from transformers import Gemma3ForConditionalGeneration
+        model = Gemma3ForConditionalGeneration.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, device_map="auto",
+            attn_implementation="eager"
+        )
     else:
         raise ValueError(f"Unsupported model_type: {model_type}")
 
@@ -80,31 +85,25 @@ def load_model(cfg: dict):
 # Single-sample inference
 # ---------------------------------------------------------------------------
 
-def infer_one(model, processor, item: dict, plugin=None) -> tuple[str, dict]:
-    """Run model on one sample; return (predicted_text, rapt_dict)."""
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "image", "image": item["image"]},
-            {"type": "text",  "text": item.get("prompt", "")},
-        ],
-    }]
+def infer_one(model, processor, item: dict, plugin) -> tuple[str, dict]:
+    """
+    Run model on one sample; return (predicted_text, rapt_dict).
 
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(
-        text=[text], images=[item["image"]], padding=True, return_tensors="pt"
-    ).to(model.device)
+    `plugin` is always required (even for base mode) so that build_prompt()
+    and compute_rapt() use the correct model-specific logic.
+    """
+    inputs, _ = plugin.build_prompt(processor, item["image"], item.get("prompt", ""))
+    inputs = inputs.to(model.device)
 
-    if plugin is not None:
-        plugin.update_masks(
-            inputs["input_ids"],
-            pixel_values=inputs.get("pixel_values"),
-            image_sizes=inputs.get("image_sizes"),
-        )
+    plugin.update_masks(
+        inputs["input_ids"],
+        pixel_values=inputs.get("pixel_values"),
+        image_sizes=inputs.get("image_sizes"),
+    )
 
     with torch.no_grad():
         out_with_attn = model(**inputs, output_attentions=True)
-        rapt = compute_rapt(out_with_attn, inputs["input_ids"][0])
+        rapt = plugin.compute_rapt(out_with_attn, inputs["input_ids"][0])
 
         gen_ids = model.generate(**inputs, max_new_tokens=10)
         gen_ids = gen_ids[0][inputs["input_ids"].shape[1]:]
@@ -138,7 +137,7 @@ def evaluate_mode(
 
     for item in tqdm(dataset, desc=f"  {mode_name}"):
         gt = str(item["label"]).strip()
-        pred_text, rapt = infer_one(model, processor, item, plugin=plugin)
+        pred_text, rapt = infer_one(model, processor, item, plugin)
         pred = extract_digit(pred_text)
 
         if pred == gt:
@@ -208,8 +207,18 @@ def main():
 
     results = []
 
-    # Mode 1: Base (no plugin)
-    results.append(evaluate_mode("Base (No Plugin)", model, processor, test_ds, plugin=None))
+    # Create a base plugin (not applied) — used only for build_prompt() and
+    # compute_rapt() so that both Base and Plugin modes use consistent formatting.
+    base_plugin = build_plugin(
+        cfg["model_type"], model,
+        boost_strength = 0.0,
+        mode           = cfg.get("mode", "image"),
+        learnable      = False,
+    )
+    # NOTE: base_plugin.apply() is intentionally NOT called here.
+
+    # Mode 1: Base (no plugin attention bias)
+    results.append(evaluate_mode("Base (No Plugin)", model, processor, test_ds, plugin=base_plugin))
 
     # Mode 2: Trained plugin (if checkpoint exists) OR fixed-strength plugin (fallback)
     if os.path.exists(checkpoint_path):

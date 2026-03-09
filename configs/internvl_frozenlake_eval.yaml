@@ -4,7 +4,7 @@ model_path : /code/InternVL3_5-4B
 data_path  : /code/data/frozenlake_probe_train/train.parquet
 
 # Checkpoint to evaluate (trained plugin)
-checkpoint : /code/Intervention/checkpoints/internvl_frozenlake/best_plugin.pt
+checkpoint : null
 
 # Results output
 output_dir : /code/Intervention/results/internvl_frozenlake

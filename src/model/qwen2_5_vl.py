@@ -40,8 +40,9 @@ class Qwen25VLPlugin(BaseAttentionPlugin):
         mode: str = "image",
         layer_range: Optional[List[int]] = None,
         learnable: bool = False,
+        free_train: bool = True,
     ):
-        super().__init__(model, boost_strength, mode, layer_range, learnable)
+        super().__init__(model, boost_strength, mode, layer_range, learnable, free_train)
 
     # ------------------------------------------------------------------
     def _get_layers(self) -> list:

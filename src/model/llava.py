@@ -51,9 +51,10 @@ class LlavaNextPlugin(BaseAttentionPlugin):
         mode: str = "image",
         layer_range: Optional[List[int]] = None,
         learnable: bool = False,
+        free_train: bool = True,
     ):
         self.image_token_index: int = getattr(model.config, "image_token_index", 32000)
-        super().__init__(model, boost_strength, mode, layer_range, learnable)
+        super().__init__(model, boost_strength, mode, layer_range, learnable, free_train)
 
     # ------------------------------------------------------------------
     def _get_layers(self) -> list:
@@ -70,6 +71,24 @@ class LlavaNextPlugin(BaseAttentionPlugin):
         if hasattr(self.model, "model") and hasattr(self.model.model, "language_model"):
             return self.model.model.language_model
         return self.model
+
+    def build_prompt(self, processor, image, prompt_text: str) -> tuple:
+        """
+        LLaVA: message content uses {"type":"image"} WITHOUT an embedded PIL;
+        the image is passed separately via the `images=` kwarg to the processor.
+        """
+        if processor.tokenizer.pad_token is None:
+            processor.tokenizer.pad_token = processor.tokenizer.eos_token
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": prompt_text},
+            ],
+        }]
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=[text], images=[image], padding=True, return_tensors="pt")
+        return inputs, messages
 
     # ------------------------------------------------------------------
     # Override update_masks: use dummy-forward + hook to get expanded seq_len

@@ -7,11 +7,12 @@ output_dir : /code/Intervention/checkpoints/llava_frozenlake
 # Plugin
 mode          : image
 boost_strength_init : 0.0
+free_train    : false        # false = unified scalar (1 param); true = per-layer (N params)
 # layer_range : null         # null = auto (deeper half)
 
 # Training
 num_epochs   : 50
 batch_size   : 8            # Mistral-7B requires smaller batch
-learning_rate: 1.0e-2
+learning_rate: 1.0e-3
 eval_every   : 5
 max_samples  : null

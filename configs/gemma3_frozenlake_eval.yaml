@@ -1,0 +1,14 @@
+# Eval config — Gemma-3-4B + FrozenLake probe (VQA accuracy)
+model_type : gemma3
+model_path : /code/gemma-3-4b
+data_path  : /code/data/frozenlake_probe_train/train.parquet
+
+# Checkpoint to evaluate (trained plugin)
+checkpoint : null
+
+# Results output
+output_dir : /code/Intervention/results/gemma3_frozenlake
+
+# Eval options
+max_samples   : null    # null = use full test split (20% of data)
+fixed_strength: 1.5     # fallback strength if checkpoint is not found

@@ -6,6 +6,7 @@ Supported:
   - Qwen3-VL    : Qwen3VLPlugin
   - LLaVA-Next  : LlavaNextPlugin
   - InternVL    : InternVLPlugin
+  - Gemma-3     : Gemma3Plugin
 
 Factory function::
 
@@ -20,12 +21,14 @@ from .qwen2_5_vl import Qwen25VLPlugin
 from .qwen3_vl import Qwen3VLPlugin
 from .llava import LlavaNextPlugin
 from .internvl import InternVLPlugin
+from .gemma3 import Gemma3Plugin
 
 _REGISTRY = {
     "qwen2_5vl": Qwen25VLPlugin,
     "qwen3vl":   Qwen3VLPlugin,
     "llava":     LlavaNextPlugin,
     "internvl":  InternVLPlugin,
+    "gemma3":    Gemma3Plugin,
 }
 
 
@@ -41,7 +44,7 @@ def build_plugin(model_type: str, model, **kwargs) -> BaseAttentionPlugin:
     """
     key = model_type.lower().replace("-", "_").replace(".", "_")
     # normalise common aliases
-    key = key.replace("qwen2_5_vl", "qwen2_5vl").replace("qwen3_vl", "qwen3vl")
+    key = key.replace("qwen2_5_vl", "qwen2_5vl").replace("qwen3_vl", "qwen3vl").replace("gemma_3", "gemma3")
     if key not in _REGISTRY:
         raise ValueError(
             f"Unknown model_type '{model_type}'. "

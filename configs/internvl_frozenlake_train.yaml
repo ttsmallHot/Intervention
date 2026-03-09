@@ -7,6 +7,7 @@ output_dir : /code/Intervention/checkpoints/internvl_frozenlake
 # Plugin
 mode          : image
 boost_strength_init : 0.0
+free_train    : false        # false = unified scalar (1 param); true = per-layer (N params)
 # layer_range : null         # null = auto (deeper half of Qwen3-36L LLM)
 
 # Training

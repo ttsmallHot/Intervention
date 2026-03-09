@@ -45,12 +45,13 @@ class InternVLPlugin(BaseAttentionPlugin):
         mode: str = "image",
         layer_range: Optional[List[int]] = None,
         learnable: bool = False,
+        free_train: bool = True,
     ):
         # img_context_token_id is set dynamically on the model after loading
         self.img_context_token_id: Optional[int] = getattr(
             model, "img_context_token_id", None
         )
-        super().__init__(model, boost_strength, mode, layer_range, learnable)
+        super().__init__(model, boost_strength, mode, layer_range, learnable, free_train)
 
     # ------------------------------------------------------------------
     def _get_layers(self) -> list:
