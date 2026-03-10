@@ -4,7 +4,7 @@ model_path : /code/gemma-3-4b
 data_path  : /code/data/frozenlake_probe_train/train.parquet
 
 # Checkpoint to evaluate (trained plugin)
-checkpoint : null
+checkpoint : /code/Intervention/checkpoints/gemma3_frozenlake/best_plugin.pt
 
 # Results output
 output_dir : /code/Intervention/results/gemma3_frozenlake
