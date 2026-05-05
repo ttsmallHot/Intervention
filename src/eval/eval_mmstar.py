@@ -155,8 +155,14 @@ def evaluate_mode(mode_name: str, model, processor, samples: list,
 
         with torch.no_grad():
             gen_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
-            gen_ids = gen_ids[0][inputs["input_ids"].shape[1]:]
-            pred_text = processor.decode(gen_ids, skip_special_tokens=True)
+            gen_ids_sliced = gen_ids[0][inputs["input_ids"].shape[1]:]
+            pred_text = processor.decode(gen_ids_sliced, skip_special_tokens=True)
+
+        # Clear GPU memory aggressively to prevent loop OOM
+        del inputs
+        del gen_ids
+        del gen_ids_sliced
+        torch.cuda.empty_cache()
 
         pred = extract_option(pred_text)
         if not pred:
