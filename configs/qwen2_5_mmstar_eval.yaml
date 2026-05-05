@@ -1,18 +1,19 @@
-# Eval config — Qwen2.5-VL-3B + RefCOCO (Acc@0.5)
+# Eval config — Qwen2.5-VL-3B + MMStar (Accuracy)
 model_type : qwen2_5vl
 model_path : /code/Qwen2.5-VL-3B-Instruct
 
-# HuggingFace dataset — images are bundled
-dataset_id   : lmms-lab/RefCOCO   # alt: jxu124/refcoco
-dataset_split: testA               # val | testA | testB | test
+# HuggingFace dataset
+dataset_id   : Lin-Chen/MMStar
+dataset_split: val
 
 # Checkpoint to evaluate; set to null to skip and use fixed_strength instead
 checkpoint : /code/Intervention/checkpoints/qwen2_5_frozenlake/best_plugin.pt
 
 # Results output
-output_dir : /code/Intervention/results/qwen2_5_refcoco
+output_dir : /code/Intervention/results/qwen2_5_mmstar
 
 # Eval options
 max_samples   : null   # null = all samples
 fixed_strength: 1.0    # fallback strength if no checkpoint
 mode          : image  # image | text | both | oppose
+max_new_tokens: 10
