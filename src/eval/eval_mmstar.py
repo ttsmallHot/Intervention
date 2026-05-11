@@ -158,6 +158,7 @@ def evaluate_mode(mode_name: str, model, processor, samples: list,
             gen_ids_sliced = gen_ids[0][inputs["input_ids"].shape[1]:]
             pred_text = processor.decode(gen_ids_sliced, skip_special_tokens=True)
 
+        inputs = {k: v.to('cpu') if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         # Clear GPU memory aggressively to prevent loop OOM
         del inputs
         del gen_ids
