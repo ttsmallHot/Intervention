@@ -253,44 +253,22 @@ def main():
                       max_new_tokens=args.max_new_tokens or cfg.get("max_new_tokens", 10))
     )
 
-    # Mode 2: Trained or fixed-strength plugin
-    if os.path.exists(checkpoint_path):
-        print(f"\n[3] Loading checkpoint: {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
-        plugin = build_plugin(
-            cfg["model_type"], model,
-            boost_strength=0.0,
-            mode=ckpt.get("mode", cfg.get("mode", "image")),
-            layer_range=ckpt.get("layer_range"),
-            learnable=True,
-            free_train=ckpt.get("free_train", cfg.get("free_train", True)),
-        )
-        load_checkpoint(plugin, checkpoint_path)
-        plugin.apply()
-        print(f"  epoch   : {ckpt.get('epoch')}")
-        print(f"  val_acc : {ckpt.get('val_acc', 0):.4f}")
-        results.append(
-            evaluate_mode("Base + Trained Plugin", model, processor,
-                          samples, plugin=plugin,
-                          max_new_tokens=args.max_new_tokens or cfg.get("max_new_tokens", 10))
-        )
-        plugin.disable()
-    else:
-        strength = cfg.get("fixed_strength", 1.0)
-        print(f"\n[3] No checkpoint — fixed plugin (strength={strength})")
-        plugin = build_plugin(
-            cfg["model_type"], model,
-            boost_strength=strength,
-            mode=cfg.get("mode", "image"),
-            learnable=False,
-        )
-        plugin.apply()
-        results.append(
-            evaluate_mode(f"Base + Fixed Plugin (s={strength})",
-                          model, processor, samples, plugin=plugin,
-                          max_new_tokens=args.max_new_tokens or cfg.get("max_new_tokens", 10))
-        )
-        plugin.disable()
+    # Mode 2: Train-Free / Fixed-strength plugin
+    strength = cfg.get("fixed_strength", 1.0)
+    print(f"\n[3] Evaluating Train-Free Plugin (strength={strength})")
+    plugin = build_plugin(
+        cfg["model_type"], model,
+        boost_strength=strength,
+        mode=cfg.get("mode", "image"),
+        learnable=False,
+    )
+    plugin.apply()
+    results.append(
+        evaluate_mode(f"Base + Train-Free Plugin (s={strength})",
+                      model, processor, samples, plugin=plugin,
+                      max_new_tokens=args.max_new_tokens or cfg.get("max_new_tokens", 10))
+    )
+    plugin.disable()
 
     # Summary
     print(f"\n{'='*60}")
