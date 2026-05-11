@@ -115,6 +115,11 @@ def load_mmstar(dataset_id: str, split: str, max_samples: Optional[int]):
         if image is None or question is None or answer is None:
             continue
 
+        # Prevent OOM from extremely large images in MMStar
+        if hasattr(image, 'width') and hasattr(image, 'height'):
+            if image.width > 1536 or image.height > 1536:
+                image.thumbnail((1536, 1536))
+
         prompt = f"{question}\nAnswer with the option letter only."
         samples.append({"image": image, "prompt": prompt, "answer": str(answer)})
 
