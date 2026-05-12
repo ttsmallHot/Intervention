@@ -38,8 +38,21 @@ class VQADataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
+        image = item["image"]
+        
+        # Parse dict to PIL image if needed (from Parquet dict with "bytes")
+        if isinstance(image, dict) and "bytes" in image:
+            import io
+            from PIL import Image
+            image = Image.open(io.BytesIO(image["bytes"])).convert("RGB")
+
+        # Protect against OOM from extremely large images
+        if hasattr(image, 'width') and hasattr(image, 'height'):
+            if image.width > 1536 or image.height > 1536:
+                image.thumbnail((1536, 1536))
+
         return {
-            "image":  item["image"],
+            "image":  image,
             "prompt": item.get("prompt", ""),
             "label":  str(item["label"]),
             "mode":   self.mode,
