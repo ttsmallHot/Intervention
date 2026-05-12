@@ -152,7 +152,11 @@ def train(cfg: dict):
     print(f"  Attention Intervention Training")
     print(f"  model_type : {cfg['model_type']}")
     print(f"  model_path : {cfg['model_path']}")
-    print(f"  data_path  : {cfg['data_path']}")
+    if "train_data_path" in cfg:
+        print(f"  train_data : {cfg['train_data_path']}")
+        print(f"  val_data   : {cfg['val_data_path']}")
+    else:
+        print(f"  data_path  : {cfg.get('data_path', 'Not provided')}")
     print(f"  output_dir : {cfg['output_dir']}")
     print("=" * 65)
 
