@@ -33,51 +33,7 @@ sys.path.insert(0, os.path.join(_HERE, "..", ".."))
 
 from src.model import build_plugin
 from src.train.utils import load_checkpoint
-
-
-# ---------------------------------------------------------------------------
-# Model loader
-# ---------------------------------------------------------------------------
-
-def load_model(cfg: dict):
-    model_type = cfg["model_type"]
-    model_path = cfg["model_path"]
-
-    if model_type == "qwen2_5vl":
-        from transformers import Qwen2_5_VLForConditionalGeneration
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto",
-            attn_implementation="eager",
-        )
-    elif model_type == "qwen3vl":
-        from transformers import Qwen3VLForConditionalGeneration
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto",
-            attn_implementation="eager",
-        )
-    elif model_type == "llava":
-        from transformers import LlavaNextForConditionalGeneration
-        model = LlavaNextForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto",
-            attn_implementation="eager",
-        )
-    elif model_type == "internvl":
-        import transformers
-        model = transformers.AutoModel.from_pretrained(
-            model_path, trust_remote_code=True,
-            torch_dtype=torch.bfloat16, device_map="auto",
-        )
-    elif model_type == "gemma3":
-        from transformers import Gemma3ForConditionalGeneration
-        model = Gemma3ForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto",
-            attn_implementation="eager",
-        )
-    else:
-        raise ValueError(f"Unsupported model_type: {model_type}")
-
-    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-    return model, processor
+from src.eval.utils import load_model, infer_one
 
 
 # ---------------------------------------------------------------------------
@@ -115,13 +71,8 @@ def load_mmstar(dataset_id: str, split: str, max_samples: Optional[int]):
         if image is None or question is None or answer is None:
             continue
 
-        # Prevent OOM from extremely large images in MMStar
-        if hasattr(image, 'width') and hasattr(image, 'height'):
-            if image.width > 1536 or image.height > 1536:
-                image.thumbnail((1536, 1536))
-
         prompt = f"{question}\nAnswer with the option letter only."
-        samples.append({"image": image, "prompt": prompt, "answer": str(answer)})
+        samples.append({"image": image, "prompt": prompt, "label": str(answer)})
 
     print(f"  Loaded {len(samples)} samples.")
     return samples
@@ -147,34 +98,16 @@ def evaluate_mode(mode_name: str, model, processor, samples: list,
     parse_fail = 0
 
     for item in tqdm(samples, desc=f"  {mode_name}"):
-        inputs, _ = plugin.build_prompt(
-            processor, item["image"], item.get("prompt", "")
+        pred_text, _ = infer_one(
+            model, processor, item["image"], item.get("prompt", ""), 
+            plugin, max_new_tokens=max_new_tokens, compute_rapt=False
         )
-        inputs = inputs.to(model.device)
-
-        plugin.update_masks(
-            inputs["input_ids"],
-            pixel_values=inputs.get("pixel_values"),
-            image_sizes=inputs.get("image_sizes"),
-        )
-
-        with torch.no_grad():
-            gen_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
-            gen_ids_sliced = gen_ids[0][inputs["input_ids"].shape[1]:]
-            pred_text = processor.decode(gen_ids_sliced, skip_special_tokens=True)
-
-        inputs = {k: v.to('cpu') if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-        # Clear GPU memory aggressively to prevent loop OOM
-        del inputs
-        del gen_ids
-        del gen_ids_sliced
-        torch.cuda.empty_cache()
 
         pred = extract_option(pred_text)
         if not pred:
             parse_fail += 1
             continue
-        gt = str(item["answer"]).strip().upper()
+        gt = str(item["label"]).strip().upper()
         if pred == gt:
             correct += 1
 

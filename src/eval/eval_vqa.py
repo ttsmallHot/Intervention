@@ -34,83 +34,12 @@ sys.path.insert(0, os.path.join(_HERE, "..", ".."))
 
 from src.model import build_plugin
 from src.train.utils import save_checkpoint, load_checkpoint, VQADataset
+from src.eval.utils import load_model, infer_one
 
 
 # ---------------------------------------------------------------------------
-# Model loader (mirrors train.py)
+# Evaluate one mode
 # ---------------------------------------------------------------------------
-
-def load_model(cfg: dict):
-    model_type = cfg["model_type"]
-    model_path = cfg["model_path"]
-
-    if model_type == "qwen2_5vl":
-        from transformers import Qwen2_5_VLForConditionalGeneration
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto",
-            attn_implementation="eager"
-        )
-    elif model_type == "qwen3vl":
-        from transformers import Qwen3VLForConditionalGeneration
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto",
-            attn_implementation="eager"
-        )
-    elif model_type == "llava":
-        from transformers import LlavaNextForConditionalGeneration
-        model = LlavaNextForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto",
-            attn_implementation="eager"
-        )
-    elif model_type == "internvl":
-        import transformers
-        model = transformers.AutoModel.from_pretrained(
-            model_path, trust_remote_code=True,
-            torch_dtype=torch.bfloat16, device_map="auto"
-        )
-    elif model_type == "gemma3":
-        from transformers import Gemma3ForConditionalGeneration
-        model = Gemma3ForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto",
-            attn_implementation="eager"
-        )
-    else:
-        raise ValueError(f"Unsupported model_type: {model_type}")
-
-    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-    return model, processor
-
-
-# ---------------------------------------------------------------------------
-# Single-sample inference
-# ---------------------------------------------------------------------------
-
-def infer_one(model, processor, item: dict, plugin) -> tuple[str, dict]:
-    """
-    Run model on one sample; return (predicted_text, rapt_dict).
-
-    `plugin` is always required (even for base mode) so that build_prompt()
-    and compute_rapt() use the correct model-specific logic.
-    """
-    inputs, _ = plugin.build_prompt(processor, item["image"], item.get("prompt", ""))
-    inputs = inputs.to(model.device)
-
-    plugin.update_masks(
-        inputs["input_ids"],
-        pixel_values=inputs.get("pixel_values"),
-        image_sizes=inputs.get("image_sizes"),
-    )
-
-    with torch.no_grad():
-        out_with_attn = model(**inputs, output_attentions=True)
-        rapt = plugin.compute_rapt(out_with_attn, inputs["input_ids"][0])
-
-        gen_ids = model.generate(**inputs, max_new_tokens=10)
-        gen_ids = gen_ids[0][inputs["input_ids"].shape[1]:]
-        text_out = processor.decode(gen_ids, skip_special_tokens=True)
-
-    return text_out, rapt
-
 
 def extract_digit(text: str) -> str:
     digits = re.findall(r"\d+", text)
@@ -137,7 +66,10 @@ def evaluate_mode(
 
     for item in tqdm(dataset, desc=f"  {mode_name}"):
         gt = str(item["label"]).strip()
-        pred_text, rapt = infer_one(model, processor, item, plugin)
+        pred_text, rapt = infer_one(
+            model, processor, item["image"], item.get("prompt", ""), 
+            plugin, max_new_tokens=10, compute_rapt=True
+        )
         pred = extract_digit(pred_text)
 
         if pred == gt:

@@ -179,29 +179,37 @@ def train(cfg: dict):
     plugin.apply()
 
     # 3. Load dataset
-    print(f"\n[3] Loading dataset: {cfg['data_path']}")
-    ds = load_dataset("parquet", data_files={"train": cfg["data_path"]})["train"]
-    max_samples = cfg.get("max_samples", None)
-    indices = list(range(len(ds)))[:max_samples] if max_samples else list(range(len(ds)))
-    train_idx, val_idx = train_test_split(
-        indices, test_size=0.2, random_state=42  # fixed split, must match eval
-    )
+    print(f"\n[3] Loading dataset...")
+    if "train_data_path" in cfg and "val_data_path" in cfg:
+        # Load pre-split datasets
+        train_ds = load_dataset("parquet", data_files={"train": cfg["train_data_path"]})["train"]
+        val_ds = load_dataset("parquet", data_files={"train": cfg["val_data_path"]})["train"]
+    else:
+        # Fallback to older single-file split
+        ds = load_dataset("parquet", data_files={"train": cfg["data_path"]})["train"]
+        max_samples = cfg.get("max_samples", None)
+        indices = list(range(len(ds)))[:max_samples] if max_samples else list(range(len(ds)))
+        train_idx, val_idx = train_test_split(
+            indices, test_size=0.2, random_state=42
+        )
+        train_ds = ds.select(train_idx)
+        val_ds = ds.select(val_idx)
 
     collate_fn = get_collate_fn(cfg["model_type"], processor)
 
     train_loader = DataLoader(
-        VQADataset(ds.select(train_idx), processor, mode="train"),
+        VQADataset(train_ds, processor, mode="train"),
         batch_size = cfg.get("batch_size", 32),
         shuffle    = True,
         collate_fn = collate_fn,
     )
     val_loader = DataLoader(
-        VQADataset(ds.select(val_idx), processor, mode="inference"),
-        batch_size = cfg.get("batch_size", 32),
+        VQADataset(val_ds, processor, mode="inference"),
+        batch_size = max(1, cfg.get("batch_size", 32) // 4), # Smaller batch size for val generation to avoid OOM
         shuffle    = False,
         collate_fn = collate_fn,
     )
-    print(f"    train={len(train_idx)}, val={len(val_idx)}")
+    print(f"    train={len(train_ds)}, val={len(val_ds)}")
 
     # 4. Optimizer
     optimizer = torch.optim.AdamW(
