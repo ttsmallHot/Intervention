@@ -1,4 +1,5 @@
 import os
+import io
 import pandas as pd
 from datasets import load_dataset
 from sklearn.model_selection import train_test_split
@@ -23,8 +24,13 @@ def prepare_mmstar_data(output_dir="/code/Intervention/data/mmstar"):
         # Format the prompt exactly like we do in evaluation
         prompt = f"{question}\nAnswer with the option letter only."
         
+        # Convert PIL Image to raw bytes to adhere to the required Parquet format
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format=image.format or 'PNG')
+        img_bytes = img_byte_arr.getvalue()
+        
         data.append({
-            "image": image,
+            "image": {"bytes": img_bytes},
             "prompt": prompt,
             "label": str(answer).strip().upper()
         })
