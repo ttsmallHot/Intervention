@@ -1,10 +1,8 @@
-"""
-MMStar evaluation (multiple-choice VQA): Base model vs Base + trained plugin.
-Metric: accuracy on answer option (A/B/C/D).
+"""MMStar evaluation (multiple-choice VQA): Base model vs Base + trained plugin.
 
 Usage
 -----
-python src/eval/eval_refcoco.py --config configs/qwen2_5_mmstar_eval.yaml
+python src/eval/eval_mmstar.py --config configs/qwen2_5_mmstar_eval.yaml
 
 Optional overrides:
     --checkpoint /path/to/best_plugin.pt
@@ -14,31 +12,24 @@ Optional overrides:
 """
 
 from __future__ import annotations
-import argparse
-import json
 import os
-import re
 import sys
-from datetime import datetime
 from typing import Optional
-
-import yaml
-import torch
-from datasets import load_dataset
-from tqdm import tqdm
-from transformers import AutoProcessor
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", ".."))
 
-from src.model import build_plugin
-from src.train.utils import load_checkpoint
-from src.eval.utils import load_model, infer_one
+from datasets import load_dataset
 
+from src.common.extractors import extract_option
+from src.eval.engine import (
+    ParseFailTracker,
+    base_parser,
+    load_cfg_with_overrides,
+    run_eval_pipeline,
+    _resolve_checkpoint,
+)
 
-# ---------------------------------------------------------------------------
-# Dataset loading
-# ---------------------------------------------------------------------------
 
 def _get_field(item: dict, *candidates, default=None):
     for key in candidates:
@@ -48,179 +39,53 @@ def _get_field(item: dict, *candidates, default=None):
 
 
 def load_mmstar(dataset_id: str, split: str, max_samples: Optional[int]):
-    """
-    Load MMStar split from HuggingFace.
-
-    Returns a list of dicts with keys:
-        image  : PIL.Image
-        prompt : str
-        answer : str  (A/B/C/D)
-    """
+    """Load MMStar split from HuggingFace. Returns list of {image, prompt, label}."""
     print(f"  Loading {dataset_id}  split={split} ...")
     ds = load_dataset(dataset_id, split=split)
-
     if max_samples:
         ds = ds.select(range(min(max_samples, len(ds))))
 
     samples = []
     for item in ds:
-        image = _get_field(item, "image", "img", "pixel_values")
+        image    = _get_field(item, "image", "img", "pixel_values")
         question = _get_field(item, "question", "prompt", "text")
-        answer = _get_field(item, "answer", "label")
-
+        answer   = _get_field(item, "answer", "label")
         if image is None or question is None or answer is None:
             continue
-
-        prompt = f"{question}\nAnswer with the option letter only."
-        samples.append({"image": image, "prompt": prompt, "label": str(answer)})
+        samples.append({
+            "image":  image,
+            "prompt": f"{question}\nAnswer with the option letter only.",
+            "label":  str(answer).strip().upper(),
+        })
 
     print(f"  Loaded {len(samples)} samples.")
     return samples
 
 
-def extract_option(text: str) -> str:
-    text = text.upper()
-    match = re.search(r"\b([A-D])\b", text)
-    return match.group(1) if match else ""
-
-
-# ---------------------------------------------------------------------------
-# Evaluate one mode
-# ---------------------------------------------------------------------------
-
-def evaluate_mode(mode_name: str, model, processor, samples: list,
-                  plugin=None, max_new_tokens: int = 10) -> dict:
-    print(f"\n{'='*60}")
-    print(f"  Mode: {mode_name}")
-    print(f"{'='*60}")
-
-    correct = 0
-    parse_fail = 0
-
-    for item in tqdm(samples, desc=f"  {mode_name}"):
-        pred_text, _ = infer_one(
-            model, processor, item["image"], item.get("prompt", ""), 
-            plugin, max_new_tokens=max_new_tokens, compute_rapt=False
-        )
-
-        pred = extract_option(pred_text)
-        if not pred:
-            parse_fail += 1
-            continue
-        gt = str(item["label"]).strip().upper()
-        if pred == gt:
-            correct += 1
-
-    n = len(samples)
-    acc = correct / n if n > 0 else 0.0
-    result = {
-        "mode":       mode_name,
-        "accuracy":   acc,
-        "correct":    correct,
-        "total":      n,
-        "parse_fail": parse_fail,
-    }
-    print(f"  Accuracy  : {acc:.2%} ({correct}/{n})")
-    print(f"  Parse fail: {parse_fail}/{n}")
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Eval: Base vs Base+Plugin (MMStar)"
-    )
-    parser.add_argument("--config",      required=True)
-    parser.add_argument("--checkpoint",  default=None)
-    parser.add_argument("--max_samples", type=int, default=None)
-    parser.add_argument("--split",       default=None, help="Override dataset_split")
-    parser.add_argument("--output_dir",  default=None)
-    parser.add_argument("--max_new_tokens", type=int, default=None)
+    parser = base_parser("Eval: Base vs Base+Plugin (MMStar)")
+    parser.add_argument("--split", default=None, help="Override dataset_split")
     args = parser.parse_args()
 
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
-    if args.output_dir:
-        cfg["output_dir"] = args.output_dir
+    cfg = load_cfg_with_overrides(args, "max_samples")
     if args.split:
         cfg["dataset_split"] = args.split
-
-    checkpoint_path = (
-        args.checkpoint
-        or cfg.get("checkpoint")
-        or os.path.join(cfg.get("output_dir", ""), "best_plugin.pt")
-    )
-    output_dir = cfg.get("output_dir", "eval_results")
-    os.makedirs(output_dir, exist_ok=True)
-
-    print("\n[1] Loading model...")
-    model, processor = load_model(cfg)
-    for p in model.parameters():
-        p.requires_grad = False
 
     print("\n[2] Loading dataset...")
     samples = load_mmstar(
         dataset_id  = cfg.get("dataset_id", "Lin-Chen/MMStar"),
         split       = cfg.get("dataset_split", "val"),
-        max_samples = args.max_samples or cfg.get("max_samples"),
+        max_samples = cfg.get("max_samples"),
     )
 
-    results = []
-
-    # Shared base plugin — used for consistent build_prompt/compute_rapt,
-    # but NOT applied (boost_strength=0 keeps attention unmodified).
-    base_plugin = build_plugin(
-        cfg["model_type"], model,
-        boost_strength=0.0,
-        mode=cfg.get("mode", "image"),
-        learnable=False,
+    run_eval_pipeline(
+        cfg, samples, extract_option,
+        tag="mmstar",
+        checkpoint_path=_resolve_checkpoint(args.checkpoint, cfg),
+        max_new_tokens=args.max_new_tokens or cfg.get("max_new_tokens", 10),
+        compute_rapt=False,
+        make_hooks=lambda: [ParseFailTracker()],
     )
-
-    # Mode 1: Base
-    results.append(
-        evaluate_mode("Base (No Plugin)", model, processor,
-                      samples, plugin=base_plugin,
-                      max_new_tokens=args.max_new_tokens or cfg.get("max_new_tokens", 10))
-    )
-
-    # Mode 2: Train-Free / Fixed-strength plugin
-    strength = cfg.get("fixed_strength", 1.0)
-    print(f"\n[3] Evaluating Train-Free Plugin (strength={strength})")
-    plugin = build_plugin(
-        cfg["model_type"], model,
-        boost_strength=strength,
-        mode=cfg.get("mode", "image"),
-        learnable=False,
-    )
-    plugin.apply()
-    results.append(
-        evaluate_mode(f"Base + Train-Free Plugin (s={strength})",
-                      model, processor, samples, plugin=plugin,
-                      max_new_tokens=args.max_new_tokens or cfg.get("max_new_tokens", 10))
-    )
-    plugin.disable()
-
-    # Summary
-    print(f"\n{'='*60}")
-    print("  Summary")
-    print(f"{'='*60}")
-    print(f"  {'Mode':<30} {'Acc':>8}")
-    print(f"  {'-'*30} {'-'*8}")
-    for r in results:
-        print(f"  {r['mode']:<30} {r['accuracy']:>7.2%}")
-    if len(results) >= 2:
-        delta = results[-1]["accuracy"] - results[0]["accuracy"]
-        sign = "+" if delta >= 0 else ""
-        print(f"\n  Plugin effect: {sign}{delta:.2%}")
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(output_dir, f"eval_mmstar_{ts}.json")
-    with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\n  Results saved -> {out_path}")
 
 
 if __name__ == "__main__":

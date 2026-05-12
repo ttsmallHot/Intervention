@@ -1,108 +1,45 @@
-"""
-Unified training script for Attention Intervention plugins.
-
-Supports: qwen2_5vl | qwen3vl | llava | internvl | gemma3
-Dataset : VQA-style parquet (image, prompt, label)
-
-Usage
------
-python src/train/train.py \
-    --config configs/qwen2_5_frozenlake.yaml
-
-Or override any field directly:
-python src/train/train.py \
-    --config configs/qwen2_5_frozenlake.yaml \
-    --num_epochs 30 \
-    --batch_size 16
-"""
-
-from __future__ import annotations
-import argparse
 import os
-import sys
-import re
-
+import argparse
 import yaml
 import torch
-from torch.utils.data import DataLoader
-from transformers import AutoProcessor
 from datasets import load_dataset
 from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Make sure project root is on sys.path when running as a script
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_HERE, "..", ".."))
-
+from src.common.checkpoint import save_checkpoint
+from src.common.models import load_model_and_processor
 from src.model import build_plugin
 from src.train.utils import (
-    VQADataset, collate_qwen, collate_gemma3, collate_llava,
-    compute_accuracy, save_checkpoint
+    VQADataset, collate_qwen, collate_gemma3, collate_llava, collate_internvl,
 )
 
+
 # ---------------------------------------------------------------------------
-# Model loaders
+# Collate registry
 # ---------------------------------------------------------------------------
 
-def load_model_and_processor(cfg: dict):
-    model_type  = cfg["model_type"]
-    model_path  = cfg["model_path"]
-
-    if model_type in ("qwen2_5vl",):
-        from transformers import Qwen2_5_VLForConditionalGeneration
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto",
-            attn_implementation="eager"
-        )
-    elif model_type == "qwen3vl":
-        from transformers import Qwen3VLForConditionalGeneration
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto",
-            attn_implementation="eager"
-        )
-    elif model_type == "llava":
-        from transformers import LlavaNextForConditionalGeneration
-        model = LlavaNextForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto",
-            attn_implementation="eager"
-        )
-    elif model_type == "internvl":
-        import transformers
-        model = transformers.AutoModel.from_pretrained(
-            model_path, trust_remote_code=True,
-            torch_dtype=torch.bfloat16, device_map="auto"
-        )
-    elif model_type == "gemma3":
-        from transformers import Gemma3ForConditionalGeneration
-        model = Gemma3ForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto",
-            attn_implementation="eager"
-        )
-    else:
-        raise ValueError(f"Unsupported model_type: {model_type}")
-
-    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-    return model, processor
+COLLATE_FNS = {
+    "qwen2_5vl": collate_qwen,
+    "qwen3vl":   collate_qwen,
+    "gemma3":    collate_gemma3,
+    "llava":     collate_llava,
+    "internvl":  collate_internvl,
+}
 
 
 def get_collate_fn(model_type: str, processor):
-    if model_type in ("qwen2_5vl", "qwen3vl"):
-        return lambda batch: collate_qwen(batch, processor)
-    elif model_type == "gemma3":
-        return lambda batch: collate_gemma3(batch, processor)
-    elif model_type == "llava":
-        return lambda batch: collate_llava(batch, processor)
-    elif model_type == "internvl":
-        from src.train.utils import collate_internvl
-        return lambda batch: collate_internvl(batch, processor)
-    raise ValueError(f"No collate_fn for model_type: {model_type}")
+    if model_type not in COLLATE_FNS:
+        raise ValueError(f"No collate_fn for model_type: {model_type}")
+    fn = COLLATE_FNS[model_type]
+    return lambda batch: fn(batch, processor)
 
 
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
-def evaluate(model, processor, plugin, val_loader, model_type: str, print_samples: int = 4) -> float:
+def evaluate(model, processor, plugin, val_loader, extract_fn, print_samples: int = 4) -> float:
     model.eval()
     plugin.eval()
     all_outputs, all_labels = [], []
@@ -126,28 +63,33 @@ def evaluate(model, processor, plugin, val_loader, model_type: str, print_sample
             all_outputs.extend(texts)
             all_labels.extend(labels)
 
-    acc = compute_accuracy(all_outputs, all_labels)
-
-    # Print a few samples so we can see what the model is actually generating
+    correct = 0
     if print_samples > 0:
         print(f"\n  {'label':<8} {'output':<40} {'correct'}")
         print(f"  {'-'*8} {'-'*40} {'-'*7}")
-        for i in range(min(print_samples, len(all_labels))):
-            out = all_outputs[i].strip().replace("\n", " ")[:40]
-            lbl = all_labels[i]
-            nums = re.findall(r'\d+', all_outputs[i])
-            ok = "✓" if nums and nums[0] == lbl else "✗"
-            print(f"  {lbl:<8} {out:<40} {ok}")
+
+    for i, (out, lbl) in enumerate(zip(all_outputs, all_labels)):
+        out_clean = out.strip().replace("\n", " ")
+        lbl_clean = lbl.strip()
+        pred = extract_fn(out_clean)
+        is_ok = pred == lbl_clean
+        if is_ok:
+            correct += 1
+        if i < print_samples:
+            ok_str = "✓" if is_ok else "✗"
+            print(f"  {lbl_clean:<8} {out_clean[:40]:<40} {ok_str}")
+
+    if print_samples > 0:
         print()
 
-    return acc
+    return correct / len(all_labels) if all_labels else 0.0
 
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train(cfg: dict):
+def run_train_pipeline(cfg: dict, extract_fn):
     print("=" * 65)
     print(f"  Attention Intervention Training")
     print(f"  model_type : {cfg['model_type']}")
@@ -162,14 +104,12 @@ def train(cfg: dict):
 
     os.makedirs(cfg["output_dir"], exist_ok=True)
 
-    # 1. Load model
     print("\n[1] Loading model...")
     model, processor = load_model_and_processor(cfg)
     for param in model.parameters():
         param.requires_grad = False
     print(f"    Loaded ({model.config.model_type})")
 
-    # 2. Build plugin
     print("\n[2] Initialising plugin...")
     plugin = build_plugin(
         cfg["model_type"],
@@ -182,53 +122,39 @@ def train(cfg: dict):
     )
     plugin.apply()
 
-    # 3. Load dataset
     print(f"\n[3] Loading dataset...")
     if "train_data_path" in cfg and "val_data_path" in cfg:
-        # Load pre-split datasets
         train_ds = load_dataset("parquet", data_files={"train": cfg["train_data_path"]})["train"]
-        val_ds = load_dataset("parquet", data_files={"train": cfg["val_data_path"]})["train"]
+        val_ds   = load_dataset("parquet", data_files={"train": cfg["val_data_path"]})["train"]
     else:
-        # Fallback to older single-file split
         ds = load_dataset("parquet", data_files={"train": cfg["data_path"]})["train"]
         max_samples = cfg.get("max_samples", None)
         indices = list(range(len(ds)))[:max_samples] if max_samples else list(range(len(ds)))
-        train_idx, val_idx = train_test_split(
-            indices, test_size=0.2, random_state=42
-        )
+        train_idx, val_idx = train_test_split(indices, test_size=0.2, random_state=42)
         train_ds = ds.select(train_idx)
-        val_ds = ds.select(val_idx)
+        val_ds   = ds.select(val_idx)
 
     collate_fn = get_collate_fn(cfg["model_type"], processor)
-
+    batch_size = cfg.get("batch_size", 32)
     train_loader = DataLoader(
         VQADataset(train_ds, processor, mode="train"),
-        batch_size = cfg.get("batch_size", 32),
-        shuffle    = True,
-        collate_fn = collate_fn,
+        batch_size=batch_size, shuffle=True, collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         VQADataset(val_ds, processor, mode="inference"),
-        batch_size = max(1, cfg.get("batch_size", 32) // 4), # Smaller batch size for val generation to avoid OOM
-        shuffle    = False,
-        collate_fn = collate_fn,
+        batch_size=max(1, batch_size // 4), shuffle=False, collate_fn=collate_fn,
     )
     print(f"    train={len(train_ds)}, val={len(val_ds)}")
 
-    # 4. Optimizer
-    optimizer = torch.optim.AdamW(
-        plugin.parameters(), lr=cfg.get("learning_rate", 1e-2)
-    )
+    optimizer = torch.optim.AdamW(plugin.parameters(), lr=cfg.get("learning_rate", 1e-2))
 
-    # 5. Initial baseline
     print("\n[4] Baseline validation (before training)...")
-    best_val_acc = evaluate(model, processor, plugin, val_loader, cfg["model_type"])
+    best_val_acc = evaluate(model, processor, plugin, val_loader, extract_fn=extract_fn)
     print(f"    Baseline val acc: {best_val_acc:.2%}")
 
-    eval_every  = cfg.get("eval_every", 5)
-    num_epochs  = cfg.get("num_epochs", 50)
+    eval_every = cfg.get("eval_every", 5)
+    num_epochs = cfg.get("num_epochs", 50)
 
-    # 6. Training loop
     print(f"\n[5] Training for {num_epochs} epochs...")
     for epoch in range(num_epochs):
         model.train()
@@ -261,14 +187,11 @@ def train(cfg: dict):
                 strength=f"{plugin.boost_strength.mean().item():.3f}",
             )
 
-        # Save latest checkpoint each epoch
         save_checkpoint(plugin, epoch, 0.0, cfg["output_dir"], tag="latest")
 
-        # Validation
         if (epoch + 1) % eval_every == 0 or (epoch + 1) == num_epochs:
-            val_acc = evaluate(model, processor, plugin, val_loader, cfg["model_type"])
+            val_acc = evaluate(model, processor, plugin, val_loader, extract_fn=extract_fn)
             avg_loss = total_loss / len(train_loader)
-
             print(f"\nEpoch {epoch+1:3d} | "
                   f"loss={avg_loss:.4f} | val_acc={val_acc:.2%} | "
                   f"strengths={plugin.boost_strength.data.cpu().numpy().round(3)}")
@@ -284,40 +207,38 @@ def train(cfg: dict):
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# CLI
 # ---------------------------------------------------------------------------
+
+# Single source of truth: each entry is (cli_flag, type). Adding an override
+# here automatically wires both argparse and the YAML-merge step.
+CLI_OVERRIDES = [
+    ("model_type",    str),
+    ("model_path",    str),
+    ("data_path",     str),
+    ("output_dir",    str),
+    ("num_epochs",    int),
+    ("batch_size",    int),
+    ("learning_rate", float),
+    ("max_samples",   int),
+    ("mode",          str),
+]
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Attention Intervention plugin")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
-    # Allow any config key to be overridden from CLI
-    parser.add_argument("--model_type",   default=None)
-    parser.add_argument("--model_path",   default=None)
-    parser.add_argument("--data_path",    default=None)
-    parser.add_argument("--output_dir",   default=None)
-    parser.add_argument("--num_epochs",   type=int,   default=None)
-    parser.add_argument("--batch_size",   type=int,   default=None)
-    parser.add_argument("--learning_rate",type=float, default=None)
-    parser.add_argument("--max_samples",  type=int,   default=None)
-    parser.add_argument("--mode",         default=None, help="image|text|both|oppose")
+    for name, typ in CLI_OVERRIDES:
+        parser.add_argument(f"--{name}", default=None, type=typ)
     return parser.parse_args()
 
 
-def main():
+def run_main(extract_fn):
     args = parse_args()
-
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-
-    # CLI overrides
-    for key in ("model_type", "model_path", "data_path", "output_dir",
-                "num_epochs", "batch_size", "learning_rate", "max_samples", "mode"):
-        val = getattr(args, key, None)
+    for name, _ in CLI_OVERRIDES:
+        val = getattr(args, name, None)
         if val is not None:
-            cfg[key] = val
-
-    train(cfg)
-
-
-if __name__ == "__main__":
-    main()
+            cfg[name] = val
+    run_train_pipeline(cfg, extract_fn)

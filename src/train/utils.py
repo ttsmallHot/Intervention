@@ -1,5 +1,5 @@
 """
-Training utilities: dataset, collate function, checkpoint helpers.
+Training utilities: dataset and collate functions.
 
 Works with any VQA-style parquet dataset where each row has:
   - 'image'  : PIL.Image or bytes
@@ -8,12 +8,11 @@ Works with any VQA-style parquet dataset where each row has:
 """
 
 from __future__ import annotations
-import os
-import re
-from typing import List, Callable, Optional
 
 import torch
 from torch.utils.data import Dataset
+
+from src.common.image import prepare_image
 
 
 # ---------------------------------------------------------------------------
@@ -38,18 +37,7 @@ class VQADataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
-        image = item["image"]
-        
-        # Parse dict to PIL image if needed (from Parquet dict with "bytes")
-        if isinstance(image, dict) and "bytes" in image:
-            import io
-            from PIL import Image
-            image = Image.open(io.BytesIO(image["bytes"])).convert("RGB")
-
-        # Protect against OOM from extremely large images
-        if hasattr(image, 'width') and hasattr(image, 'height'):
-            if image.width > 1536 or image.height > 1536:
-                image.thumbnail((1536, 1536))
+        image = prepare_image(item["image"])
 
         return {
             "image":  image,
@@ -60,255 +48,102 @@ class VQADataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Collate functions (one per model family)
+# Collate – one generic implementation, three thin wrappers
 # ---------------------------------------------------------------------------
+#
+# All three model families share the same recipe:
+#   1. build a chat-style message per sample
+#   2. apply_chat_template -> prompt-only text
+#   3. (train) tokenize both prompt-only and prompt+label so that
+#         label_token_count = full_real_len - prompt_real_len
+#      gives an attention-mask–accurate label span regardless of padding side
+#      or standalone-tokenization space-prefix quirks.
+#
+# Only three things differ between families:
+#   - whether `images` must be nested as [[img], [img], ...] (gemma3)
+#   - whether the chat message embeds the PIL image or just a placeholder (llava)
+#   - whether the tokenizer needs a pad_token set (llava-mistral)
 
-def collate_qwen(batch: list, processor) -> tuple:
-    """Collate for Qwen2.5-VL and Qwen3-VL (share the same processor API).
+def _build_messages(prompts, images, embed_image: bool):
+    """Return a list of single-turn user messages, with or without inline image."""
+    messages = []
+    for prompt, img in zip(prompts, images):
+        content = (
+            [{"type": "image", "image": img}, {"type": "text", "text": prompt}]
+            if embed_image
+            else [{"type": "image"}, {"type": "text", "text": prompt}]
+        )
+        messages.append([{"role": "user", "content": content}])
+    return messages
 
-    Uses the full_real_len - prompt_real_len diff method (same as collate_llava)
-    so that label token count is always accurate regardless of pad_token_id or
-    padding side.
-    """
+
+def _label_tensor(inputs, inp_prompt, batch_size):
+    """Mask everything except the label tokens (the trailing real tokens)."""
+    labels = torch.full_like(inputs["input_ids"], -100)
+    for i in range(batch_size):
+        prompt_real_len = inp_prompt["attention_mask"][i].sum().item()
+        full_real_len   = inputs["attention_mask"][i].sum().item()
+        label_token_count = full_real_len - prompt_real_len
+        if label_token_count <= 0:
+            continue
+        real_pos = inputs["attention_mask"][i].nonzero(as_tuple=True)[0]
+        label_positions = real_pos[-label_token_count:]
+        labels[i][label_positions] = inputs["input_ids"][i][label_positions]
+    return labels
+
+
+def _collate_generic(
+    batch: list,
+    processor,
+    *,
+    nest_images: bool = False,
+    embed_image: bool = True,
+    ensure_pad_token: bool = False,
+) -> tuple:
     images      = [item["image"]  for item in batch]
     prompts     = [item["prompt"] for item in batch]
     labels_text = [item["label"]  for item in batch]
     mode        = batch[0]["mode"]
 
-    # Build messages with real images (not placeholder)
-    all_messages = []
-    for img, prompt in zip(images, prompts):
-        all_messages.append([{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": img},
-                {"type": "text",  "text": prompt},
-            ],
-        }])
-
-    texts_prompt = [
-        processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
-        for m in all_messages
-    ]
-
-    if mode == "train":
-        texts_full = [tp + lb for tp, lb in zip(texts_prompt, labels_text)]
-
-        # Tokenize prompt-only and full sequence.
-        # label_token_count = full_real_len - prompt_real_len is accurate in any
-        # tokenizer context (no standalone-tokenization space-prefix issue,
-        # no hardcoded pad_token_id dependency).
-        inp_prompt = processor(
-            text=texts_prompt, images=images, padding=True, return_tensors="pt"
-        )
-        inputs = processor(
-            text=texts_full, images=images, padding=True, return_tensors="pt"
-        )
-
-        labels = torch.full_like(inputs["input_ids"], -100)
-        for i in range(len(batch)):
-            prompt_real_len   = inp_prompt["attention_mask"][i].sum().item()
-            full_real_len     = inputs["attention_mask"][i].sum().item()
-            label_token_count = full_real_len - prompt_real_len
-            if label_token_count <= 0:
-                continue
-            real_pos = inputs["attention_mask"][i].nonzero(as_tuple=True)[0]
-            label_positions = real_pos[-label_token_count:]
-            labels[i][label_positions] = inputs["input_ids"][i][label_positions]
-
-        inputs["labels"] = labels
-        return inputs, labels_text
-
-    else:  # inference
-        inputs = processor(
-            text=texts_prompt, images=images, padding=True, return_tensors="pt"
-        )
-        return inputs, labels_text
-
-
-def collate_gemma3(batch: list, processor) -> tuple:
-    """Collate for Gemma-3 multimodal processor.
-
-    Gemma3Processor requires images as a nested list [[img1], [img2], ...]
-    where each inner list corresponds to images for one text sample.
-    Passing a flat list causes "inconsistently sized batches of images/text".
-
-    Otherwise identical logic to collate_qwen (diff method for label masking).
-    """
-    images      = [item["image"]  for item in batch]
-    prompts     = [item["prompt"] for item in batch]
-    labels_text = [item["label"]  for item in batch]
-    mode        = batch[0]["mode"]
-
-    # Gemma3 processor needs nested image list
-    images_nested = [[img] for img in images]
-
-    all_messages = []
-    for img, prompt in zip(images, prompts):
-        all_messages.append([{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": img},
-                {"type": "text",  "text": prompt},
-            ],
-        }])
-
-    texts_prompt = [
-        processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
-        for m in all_messages
-    ]
-
-    if mode == "train":
-        texts_full = [tp + lb for tp, lb in zip(texts_prompt, labels_text)]
-
-        inp_prompt = processor(
-            text=texts_prompt, images=images_nested, padding=True, return_tensors="pt"
-        )
-        inputs = processor(
-            text=texts_full, images=images_nested, padding=True, return_tensors="pt"
-        )
-
-        labels = torch.full_like(inputs["input_ids"], -100)
-        for i in range(len(batch)):
-            prompt_real_len   = inp_prompt["attention_mask"][i].sum().item()
-            full_real_len     = inputs["attention_mask"][i].sum().item()
-            label_token_count = full_real_len - prompt_real_len
-            if label_token_count <= 0:
-                continue
-            real_pos = inputs["attention_mask"][i].nonzero(as_tuple=True)[0]
-            label_positions = real_pos[-label_token_count:]
-            labels[i][label_positions] = inputs["input_ids"][i][label_positions]
-
-        inputs["labels"] = labels
-        return inputs, labels_text
-
-    else:  # inference
-        inputs = processor(
-            text=texts_prompt, images=images_nested, padding=True, return_tensors="pt"
-        )
-        return inputs, labels_text
-
-
-def collate_llava(batch: list, processor) -> tuple:
-    """
-    Collate for LLaVA-Next processors.
-
-    LLaVA processor uses LEFT padding by default (needed for generate).
-    With left-padding + batch_size > 1, the prompt_len-from-left approach
-    masks PAD tokens instead of actual prompt tokens, leaking the full
-    prompt into the CE loss.
-
-    Fix: tokenize each label independently to get its exact token length,
-    then supervise ONLY the last label_len real tokens per sample.
-    """
-    images      = [item["image"]  for item in batch]
-    prompts     = [item["prompt"] for item in batch]
-    labels_text = [item["label"]  for item in batch]
-    mode        = batch[0]["mode"]
-
-    # Ensure tokenizer has a pad token (LLaVA-Mistral uses eos as pad)
-    if processor.tokenizer.pad_token is None:
+    if ensure_pad_token and processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-    all_messages = []
-    for prompt in prompts:
-        all_messages.append([{
-            "role": "user",
-            "content": [
-                {"type": "image"},   # no PIL object here; images passed separately
-                {"type": "text", "text": prompt},
-            ],
-        }])
+    images_arg = [[img] for img in images] if nest_images else images
 
+    messages = _build_messages(prompts, images, embed_image=embed_image)
     texts_prompt = [
         processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
-        for m in all_messages
+        for m in messages
     ]
 
     if mode == "train":
         texts_full = [tp + lb for tp, lb in zip(texts_prompt, labels_text)]
-
-        # Tokenize prompt-only and full sequence.
-        # The number of label tokens in context = full_real_len - prompt_real_len.
-        # This avoids the standalone-tokenization space-prefix bug
-        # (e.g. "2" → [▁, 2] alone vs [2] after [/INST]).
-        inp_prompt = processor(
-            text=texts_prompt, images=images, padding=True, return_tensors="pt"
-        )
-        inputs = processor(
-            text=texts_full, images=images, padding=True, return_tensors="pt"
-        )
-
-        labels = torch.full_like(inputs["input_ids"], -100)
-        for i in range(len(batch)):
-            prompt_real_len = inp_prompt["attention_mask"][i].sum().item()
-            full_real_len   = inputs["attention_mask"][i].sum().item()
-            label_token_count = full_real_len - prompt_real_len
-            if label_token_count <= 0:
-                continue
-            # Real (non-padding) positions in the full sequence
-            real_pos = inputs["attention_mask"][i].nonzero(as_tuple=True)[0]
-            # Supervise only the last label_token_count real tokens
-            label_positions = real_pos[-label_token_count:]
-            labels[i][label_positions] = inputs["input_ids"][i][label_positions]
-
-        inputs["labels"] = labels
-        return inputs, labels_text
-    else:
-        inputs = processor(
-            text=texts_prompt, images=images, padding=True, return_tensors="pt"
-        )
+        inp_prompt = processor(text=texts_prompt, images=images_arg, padding=True, return_tensors="pt")
+        inputs     = processor(text=texts_full,   images=images_arg, padding=True, return_tensors="pt")
+        inputs["labels"] = _label_tensor(inputs, inp_prompt, len(batch))
         return inputs, labels_text
 
+    inputs = processor(text=texts_prompt, images=images_arg, padding=True, return_tensors="pt")
+    return inputs, labels_text
 
-def collate_internvl(batch: list, tokenizer, image_size: int = 448) -> tuple:
-    """Collate for InternVL (uses its own tokenizer + pixel_values pipeline)."""
+
+def collate_qwen(batch, processor):
+    return _collate_generic(batch, processor)
+
+
+def collate_gemma3(batch, processor):
+    # Gemma3Processor requires images nested as [[img1], [img2], ...].
+    return _collate_generic(batch, processor, nest_images=True)
+
+
+def collate_llava(batch, processor):
+    # LLaVA messages use a placeholder image; PIL is passed via the `images` kwarg.
+    # LLaVA-Mistral processors have no pad_token by default.
+    return _collate_generic(batch, processor, embed_image=False, ensure_pad_token=True)
+
+
+def collate_internvl(batch, tokenizer, image_size: int = 448):
     raise NotImplementedError(
         "InternVL collate requires custom dynamic_preprocess. "
         "See InternVL3_5-4B/modeling_internvl_chat.py for reference."
     )
-
-
-# ---------------------------------------------------------------------------
-# Accuracy
-# ---------------------------------------------------------------------------
-
-def compute_accuracy(outputs: List[str], labels: List[str]) -> float:
-    correct = sum(
-        bool(re.findall(r'\d+', o)) and re.findall(r'\d+', o)[0] == l
-        for o, l in zip(outputs, labels)
-    )
-    return correct / len(labels) if labels else 0.0
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint helpers
-# ---------------------------------------------------------------------------
-
-def save_checkpoint(plugin, epoch: int, val_acc: float, output_dir: str, tag: str = "latest"):
-    os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, f"{tag}_plugin.pt")
-    torch.save({
-        "epoch":          epoch,
-        "boost_strength": plugin.boost_strength.data.cpu(),
-        "layer_range":    plugin.layer_range,
-        "mode":           plugin.mode,
-        "free_train":     plugin.free_train,
-        "val_acc":        val_acc,
-    }, path)
-    return path
-
-
-def load_checkpoint(plugin, checkpoint_path: str, device="cpu"):
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    saved = ckpt["boost_strength"].to(plugin.boost_strength.device)
-    if saved.shape != plugin.boost_strength.shape:
-        raise RuntimeError(
-            f"Checkpoint boost_strength shape {tuple(saved.shape)} "
-            f"!= plugin shape {tuple(plugin.boost_strength.shape)}. "
-            f"Checkpoint was trained with free_train="
-            f"{ckpt.get('free_train', 'unknown')}."
-        )
-    with torch.no_grad():
-        plugin.boost_strength.data.copy_(saved)
-    return ckpt
