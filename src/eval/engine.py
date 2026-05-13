@@ -223,16 +223,29 @@ def run_eval_pipeline(
         print(f"    strengths  : {plugin.boost_strength.data.cpu().numpy().round(4)}")
         mode_name = "Base + Trained Plugin"
     else:
-        strength = cfg.get("fixed_strength", 1.0)
-        print(f"\n[3] No checkpoint — using fixed plugin (strength={strength})")
-        plugin = build_plugin(
-            cfg["model_type"], model,
-            boost_strength=strength,
-            mode=cfg.get("mode", "image"),
-            learnable=False,
-        )
-        plugin.apply()
-        mode_name = f"Base + Fixed Plugin (s={strength})"
+        strengths = cfg.get("strengths", [0.3, 0.5, 1.0, 1.5, 2.0, 3.0])
+        print(f"\n[3] No checkpoint — grid-searching strength over {strengths}")
+        for s in strengths:
+            plugin = build_plugin(
+                cfg["model_type"], model,
+                boost_strength=s,
+                mode=cfg.get("mode", "image"),
+                layer_range=cfg.get("layer_range"),
+                learnable=False,
+            )
+            plugin.apply()
+            results.append(evaluate_mode(
+                f"Base + Fixed Plugin (s={s})", model, processor, samples,
+                plugin=plugin, extract_fn=extract_fn,
+                max_new_tokens=max_new_tokens, compute_rapt=compute_rapt,
+                hooks=make_hooks() if make_hooks else None,
+            ))
+            plugin.disable()
+        best = max(results[1:], key=lambda r: r["accuracy"])
+        print(f"\n  Best strength: {best['mode']}  acc={best['accuracy']:.2%}")
+        _print_summary(results)
+        _save_results(results, output_dir, tag=tag)
+        return results
 
     results.append(evaluate_mode(
         mode_name, model, processor, samples,
